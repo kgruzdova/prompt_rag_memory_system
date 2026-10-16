@@ -40,7 +40,8 @@ logger.info("RAG Pipeline готов к работе")
 # ========== ПАМЯТЬ РАЗГОВОРОВ ==========
 # Словарь для хранения истории сообщений каждого пользователя
 # Структура: {user_id: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
-conversation_history = {}
+conversation_history = {}  # Обычный диалог
+rag_history = {}  # Отдельная история вопросов к базе
 MAX_HISTORY_LENGTH = 10  # Максимум последних сообщений для контекста
 
 
@@ -144,6 +145,14 @@ def load_documents_from_directory(directory: Path) -> tuple[List[str], List[str]
     return documents, sources
 
 
+def format_rag_answer(answer: str, sources: list) -> str:
+    """Добавляет имена файлов из результатов поиска к ответу."""
+    response = f"💡 Ответ:\n{answer}"
+    if sources and not answer.startswith("❌"):
+        response += "\n\n📚 Источники контекста: " + ", ".join(dict.fromkeys(sources))
+    return response
+
+
 async def send_long_message(message: Message, text: str, max_length: int = 4000):
     """
     Отправляет длинное сообщение, разбивая его на части если нужно.
@@ -187,15 +196,15 @@ async def cmd_start(message: Message):
 <b>Доступные команды:</b>
 /start - Показать это сообщение
 /help - Подробная справка
-/ask <вопрос> - Задать вопрос с поиском в базе знаний
+/ask &lt;вопрос&gt; - Задать вопрос с поиском в базе знаний
 /ingest - Перезагрузить базу знаний (только для администраторов)
 /stats - Показать статистику системы
 /test - Проверить подключение к ProxyAPI
 
 <b>Как пользоваться:</b>
-• Просто напишите вопрос, и я найду ответ в базе знаний
+• Просто напишите вопрос для обычного ответа ИИ без поиска по базе
 • Отправьте изображение с текстом, и я его обработаю
-• Используйте /ask для явного RAG-запроса
+• Для поиска по базе с источниками используйте /ask &lt;вопрос&gt;
 
 Powered by ProxyAPI + FAISS
 """
@@ -213,12 +222,12 @@ async def cmd_help(message: Message):
 📖 <b>Подробная справка по использованию бота (ProxyAPI версия)</b>
 
 <b>1️⃣ RAG-запросы (Retrieval-Augmented Generation)</b>
-RAG - это технология, которая позволяет мне находить релевантную информацию в базе знаний и использовать её для формирования ответа.
+Для поиска по базе знаний используйте /ask &lt;вопрос&gt;. Обычные сообщения получают ответ ИИ без поиска по базе и без источников. Истории режимов раздельные.
 
 Примеры запросов:
-• "Что такое RAG и как он работает?"
-• "Как применяется RAG в поддержке клиентов?"
-• "Расскажи о преимуществах RAG в HR"
+• "/ask Что такое RAG и как он работает?"
+• "/ask Как применяется RAG в поддержке клиентов?"
+• "/ask Расскажи о преимуществах RAG в HR"
 
 <b>2️⃣ Обработка изображений</b>
 Отправьте мне изображение (фото, скриншот, скан документа), и я:
@@ -229,7 +238,7 @@ RAG - это технология, которая позволяет мне на
 Пример: отправьте фото документа с подписью "Что это значит?"
 
 <b>3️⃣ Команды</b>
-/ask <вопрос> - Явный RAG-запрос
+/ask &lt;вопрос&gt; - Явный RAG-запрос
 Пример: /ask Как работает векторный поиск?
 
 /ingest - Перезагрузка базы знаний
@@ -284,10 +293,18 @@ async def cmd_ask(message: Message):
     processing_msg = await message.answer("🔍 Ищу информацию в базе знаний...")
     
     try:
-        result = rag_pipeline.query(query)
+        user_id = message.from_user.id
+        history = rag_history.setdefault(user_id, [])
+        result = rag_pipeline.query_with_history(query, history)
+        if not result['answer'].startswith("❌"):
+            history.extend([
+                {"role": "user", "content": query},
+                {"role": "assistant", "content": result['answer']},
+            ])
+            rag_history[user_id] = history[-MAX_HISTORY_LENGTH * 2:]
         
-        # Формируем ответ БЕЗ источников
-        response_text = f"<b>💡 Ответ:</b>\n{result['answer']}"
+        # Формируем ответ с источниками
+        response_text = format_rag_answer(result['answer'], result.get('sources', []))
         
         await processing_msg.delete()
         await send_long_message(message, response_text)
@@ -319,7 +336,7 @@ async def cmd_ingest(message: Message):
             )
             return
         
-        await message.answer(f"📄 Найдено документов: {len(documents)}\nНачинаю обработку...")
+        await message.answer(f"📄 Найдено чанков: {len(documents)}\nНачинаю обработку...")
         
         success = rag_pipeline.index_documents(documents, sources)
         
@@ -328,7 +345,7 @@ async def cmd_ingest(message: Message):
             response = (
                 "✅ <b>Индексация завершена успешно!</b>\n\n"
                 f"📊 Статистика:\n"
-                f"• Документов: {stats['total_documents']}\n"
+                f"• Чанки: {stats['total_documents']}\n"
                 f"• Векторов: {stats['total_vectors']}\n"
                 f"• Размерность: {stats['dimension']}\n"
                 f"• API: {stats['api_url']}\n\n"
@@ -358,7 +375,7 @@ async def cmd_stats(message: Message):
     status_text = "Загружена" if stats['is_loaded'] else "Не загружена"
     
     # Статистика истории для пользователя
-    history_count = len(conversation_history.get(user_id, [])) // 2
+    history_count = (len(conversation_history.get(user_id, [])) + len(rag_history.get(user_id, []))) // 2
     
     stats_text = f"""
 📊 <b>Статистика RAG-системы (ProxyAPI)</b>
@@ -367,7 +384,7 @@ async def cmd_stats(message: Message):
 {status_emoji} {status_text}
 
 <b>Данные:</b>
-• Документов: {stats['total_documents']}
+• Чанки: {stats['total_documents']}
 • Векторов: {stats['total_vectors']}
 • Размерность: {stats['dimension']}
 
@@ -398,9 +415,10 @@ async def cmd_clear(message: Message):
     user_id = message.from_user.id
     logger.info(f"Очистка истории для пользователя {user_id}")
     
-    if user_id in conversation_history:
-        messages_count = len(conversation_history[user_id]) // 2
+    if user_id in conversation_history or user_id in rag_history:
+        messages_count = (len(conversation_history.get(user_id, [])) + len(rag_history.get(user_id, []))) // 2
         conversation_history[user_id] = []
+        rag_history[user_id] = []
         await message.answer(
             f"🧹 <b>История очищена!</b>\n\n"
             f"Удалено {messages_count} сообщений из контекста.\n"
@@ -462,12 +480,12 @@ async def handle_photo(message: Message):
             await message.answer(f"❌ Ошибка при обработке изображения: {result['error']}")
             return
         
-        # Формируем ответ БЕЗ источников
-        response_text = "<b>📄 Текст с изображения:</b>\n"
+        # Формируем ответ с источниками
+        response_text = "📄 Текст с изображения:\n"
         response_text += result['extracted_text'] + "\n\n"
         
-        if result.get('rag_answer'):
-            response_text += f"<b>💡 Ответ на ваш вопрос:</b>\n{result['rag_answer']}"
+        if result.get('image_answer'):
+            response_text += result['image_answer']
         
         await processing_msg.delete()
         await send_long_message(message, response_text)
@@ -483,7 +501,7 @@ async def handle_photo(message: Message):
 @dp.message(F.text)
 async def handle_text(message: Message):
     """
-    Обработчик текстовых сообщений - выполняет RAG-запрос с учетом истории.
+    Обработчик обычного диалога с ИИ без поиска по базе знаний.
     """
     query = message.text
     user_id = message.from_user.id
@@ -500,8 +518,8 @@ async def handle_text(message: Message):
         if user_id not in conversation_history:
             conversation_history[user_id] = []
         
-        # Выполняем RAG-запрос с историей
-        result = rag_pipeline.query_with_history(query, conversation_history[user_id])
+        # Обычный диалог с отдельной историей, без поиска по базе
+        result = rag_pipeline.chat_with_history(query, conversation_history[user_id])
         
         # Сохраняем в историю ЧИСТЫЕ вопросы и ответы (без RAG промптов)
         conversation_history[user_id].append({"role": "user", "content": query})
@@ -512,7 +530,7 @@ async def handle_text(message: Message):
             conversation_history[user_id] = conversation_history[user_id][-(MAX_HISTORY_LENGTH * 2):]
             logger.info(f"История обрезана до {MAX_HISTORY_LENGTH} пар сообщений")
         
-        # Формируем ответ БЕЗ источников
+        # Формируем ответ с источниками
         response_text = result['answer']
         
         await processing_msg.delete()

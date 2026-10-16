@@ -13,6 +13,7 @@ from io import BytesIO
 from rag.embedder import ProxyAPIEmbedder
 from rag.vectorstore import FAISSVectorStore
 from rag.retriever import DocumentRetriever
+from rag.grounding import build_evidence, cited_sources
 from config import (
     PROXY_API_URL,
     PROXY_API_KEY, 
@@ -107,15 +108,15 @@ class RAGPipeline:
                 "model": CHAT_MODEL
             }
         
-        # Шаг 1: Извлекаем релевантный контекст
-        context = self.retriever.retrieve_context(
-            user_query, 
-            top_k=top_k,
-            max_length=MAX_CONTEXT_LENGTH
+        # Search once; rank smaller passages from the indexed documents.
+        results = self.retriever.retrieve(user_query, top_k=max(top_k, 10))
+        context, sources = build_evidence(
+            user_query, self.vectorstore.metadata, results,
+            max_length=MAX_CONTEXT_LENGTH, top_k=top_k,
         )
-        
-        # Шаг 2: Получаем источники
-        sources = self.retriever.get_relevant_sources(user_query, top_k)
+        if not context:
+            return {"answer": "В базе знаний не найдено информации по этому вопросу.",
+                    "context": "", "sources": [], "model": CHAT_MODEL}
         
         # Шаг 3: Формируем промпт для текущего вопроса с контекстом
         prompt_with_context = RAG_PROMPT_TEMPLATE.format(
@@ -141,7 +142,7 @@ class RAGPipeline:
             payload = {
                 "model": CHAT_MODEL,
                 "messages": messages,
-                "temperature": 0.7,
+                "temperature": 0.0,
                 "max_tokens": 1000
             }
             
@@ -168,6 +169,9 @@ class RAGPipeline:
             logger.error(f"Неожиданная ошибка при генерации ответа: {e}")
             answer = f"❌ Ошибка: {str(e)}"
         
+        if not answer.startswith("❌"):
+            answer, sources = cited_sources(answer, sources)
+
         return {
             "answer": answer,
             "context": context,
@@ -176,6 +180,29 @@ class RAGPipeline:
             "clean_query": user_query  # Чистый вопрос без RAG контекста для сохранения в историю
         }
     
+    def chat_with_history(self, user_query: str, history: list = None) -> Dict[str, any]:
+        """Обычный диалог без поиска по документам и проверки цитат."""
+        messages = [{"role": "system", "content": (
+            "Ты — полезный ИИ-ассистент. Отвечай на русском языке обычным текстом без HTML. "
+            "В этом режиме у тебя нет доступа к базе документов. "
+            "Не добавляй служебные номера источников или список файлов базы знаний."
+        )}]
+        messages.extend((history or [])[-20:])
+        messages.append({"role": "user", "content": user_query})
+        try:
+            response = requests.post(
+                self.chat_endpoint, headers=self.headers,
+                json={"model": CHAT_MODEL, "messages": messages,
+                      "temperature": 0.7, "max_tokens": 1000},
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            answer = response.json()['choices'][0]['message']['content']
+        except Exception as e:
+            logger.exception("Ошибка обычного диалога")
+            answer = f"❌ Ошибка при генерации ответа: {str(e)}"
+        return {"answer": answer, "context": "", "sources": [], "model": CHAT_MODEL}
+
     def process_image(self, image_url: str, user_query: str = None) -> Dict[str, any]:
         """
         Обрабатывает изображение с помощью vision модели через ProxyAPI.
@@ -226,25 +253,25 @@ class RAGPipeline:
             
             logger.info(f"Текст извлечен из изображения, длина: {len(extracted_text)} символов")
             
-            # Шаг 2: Если есть дополнительный запрос, обрабатываем через RAG
-            if user_query and self.is_loaded:
-                logger.info("Обработка извлеченного текста через RAG")
+            # Шаг 2: Если есть вопрос к изображению, отвечаем без поиска по базе
+            if user_query:
+                logger.info("Ответ на вопрос к изображению без поиска по базе")
                 
                 # Формируем комбинированный запрос
                 combined_query = f"{user_query}\n\nТекст с изображения: {extracted_text}"
-                rag_result = self.query(combined_query)
+                image_result = self.chat_with_history(combined_query)
                 
                 return {
                     "extracted_text": extracted_text,
-                    "rag_answer": rag_result["answer"],
-                    "sources": rag_result["sources"],
+                    "image_answer": image_result["answer"],
+                    "sources": [],
                     "model": VISION_MODEL
                 }
             
             # Возвращаем только извлеченный текст
             return {
                 "extracted_text": extracted_text,
-                "rag_answer": None,
+                "image_answer": None,
                 "sources": [],
                 "model": VISION_MODEL
             }
@@ -253,7 +280,7 @@ class RAGPipeline:
             logger.error(f"Ошибка HTTP запроса при обработке изображения: {e}")
             return {
                 "extracted_text": None,
-                "rag_answer": None,
+                "image_answer": None,
                 "sources": [],
                 "error": f"Ошибка API: {str(e)}",
                 "model": VISION_MODEL
@@ -262,7 +289,7 @@ class RAGPipeline:
             logger.error(f"Ошибка при обработке изображения: {e}")
             return {
                 "extracted_text": None,
-                "rag_answer": None,
+                "image_answer": None,
                 "sources": [],
                 "error": str(e),
                 "model": VISION_MODEL
